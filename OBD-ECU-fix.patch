@@ -1,0 +1,767 @@
+--- a/app/src/main/java/com/smartmatrix/obd/ObdBluetooth.java
++++ b/app/src/main/java/com/smartmatrix/obd/ObdBluetooth.java
+@@ -3,40 +3,244 @@
+ import android.bluetooth.BluetoothAdapter;
+ import android.bluetooth.BluetoothDevice;
+ import android.bluetooth.BluetoothSocket;
++
++import java.io.IOException;
+ import java.io.InputStream;
+ import java.io.OutputStream;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Locale;
+ import java.util.UUID;
+ 
+ public class ObdBluetooth {
+     private BluetoothSocket socket;
+     private InputStream in;
+     private OutputStream out;
+-    private static final UUID SPP = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
+-    public boolean connect(String mac) {
++    private static final UUID SPP =
++            UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
++
++    private final List<String> log = new ArrayList<>();
++    private volatile boolean adapterConnected = false;
++    private volatile boolean ecuConnected = false;
++    private String adapterInfo = "";
++    private String protocol = "";
++
++    public static class ConnectionResult {
++        public final boolean adapterConnected;
++        public final boolean ecuConnected;
++        public final String message;
++
++        ConnectionResult(boolean adapterConnected, boolean ecuConnected, String message) {
++            this.adapterConnected = adapterConnected;
++            this.ecuConnected = ecuConnected;
++            this.message = message;
++        }
++    }
++
++    public synchronized ConnectionResult connect(String mac) {
++        close();
++        clearLog();
++
+         try {
+             BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+-            BluetoothDevice d = adapter.getRemoteDevice(mac);
+-            socket = d.createRfcommSocketToServiceRecord(SPP);
+-            socket.connect();
+-            in = socket.getInputStream(); out = socket.getOutputStream();
+-            command("ATZ"); command("ATE0"); command("ATL0"); command("ATS0"); command("ATSP0");
+-            return true;
+-        } catch(Exception e) { return false; }
+-    }
++            if (adapter == null) {
++                return new ConnectionResult(false, false, "Bluetooth غير متاح على الجهاز");
++            }
++
++            BluetoothDevice device = adapter.getRemoteDevice(mac);
++            adapter.cancelDiscovery();
++
++            IOException last = null;
++            try {
++                socket = device.createRfcommSocketToServiceRecord(SPP);
++                socket.connect();
++            } catch (IOException first) {
++                last = first;
++                closeSocketOnly();
++                try {
++                    socket = device.createInsecureRfcommSocketToServiceRecord(SPP);
++                    socket.connect();
++                } catch (IOException second) {
++                    last = second;
++                    closeSocketOnly();
++                    try {
++                        java.lang.reflect.Method m =
++                                device.getClass().getMethod("createRfcommSocket", int.class);
++                        socket = (BluetoothSocket) m.invoke(device, 1);
++                        socket.connect();
++                    } catch (Exception third) {
++                        if (third.getCause() instanceof IOException) {
++                            last = (IOException) third.getCause();
++                        }
++                    }
++                }
++            }
++
++            if (socket == null || !socket.isConnected()) {
++                return new ConnectionResult(false, false,
++                        "فشل فتح قناة Bluetooth: " +
++                                (last == null ? "unknown" : last.getMessage()));
++            }
++
++            in = socket.getInputStream();
++            out = socket.getOutputStream();
++            adapterConnected = true;
++            logLine("BLUETOOTH CONNECTED " + mac);
++
++            String reset = command("ATZ", 5000);
++            if (!looksLikeElmReset(reset)) {
++                return fail("المحول متصل لكن لم يستجب كـ ELM327. الرد: " + compact(reset));
++            }
++
++            String[] init = {
++                    "ATE0",
++                    "ATL0",
++                    "ATS1",
++                    "ATH0",
++                    "ATAT1",
++                    "ATAL",
++                    "ATSP0"
++            };
++
++            for (String cmd : init) {
++                String response = command(cmd, 3000);
++                if (!isOkOrExpected(response, cmd)) {
++                    return fail("فشل تهيئة " + cmd + ". الرد: " + compact(response));
++                }
++            }
++
++            String voltage = command("ATRV", 2500);
++            logLine("ADAPTER VOLTAGE <- " + compact(voltage));
++
++            // 0100 is the ECU-level handshake. ATSP0/OK only proves the adapter accepted
++            // its configuration; 41 00 proves that an ECU answered the OBD request.
++            String supported = command("0100", 8000);
++            if (!ObdEngine.hasPositivePidResponse("0100", supported)) {
++                return fail("المحول متصل، لكن ECU لم يرد على 0100. الرد: " + compact(supported));
++            }
++
++            ecuConnected = true;
++            String dp = command("ATDP", 2500);
++            protocol = compact(dp);
++            logLine("ECU ONLINE; PROTOCOL <- " + protocol);
++
++            return new ConnectionResult(true, true,
++                    "متصل بالمحول وECU؛ البروتوكول: " + protocol);
++        } catch (Exception e) {
++            return fail("خطأ اتصال: " + e.getClass().getSimpleName() + ": " + e.getMessage());
++        }
++    }
++
++    private ConnectionResult fail(String message) {
++        logLine("CONNECTION FAILED: " + message);
++        ecuConnected = false;
++        return new ConnectionResult(adapterConnected, false, message);
++    }
++
++    private boolean looksLikeElmReset(String response) {
++        String s = response == null ? "" : response.toUpperCase(Locale.US);
++        return s.contains("ELM") || s.contains("OBD") || s.contains("OK");
++    }
++
++    private boolean isOkOrExpected(String response, String cmd) {
++        String s = response == null ? "" : response.toUpperCase(Locale.US);
++        if (s.contains("ERROR") || s.contains("UNABLE") || s.contains("NO DATA")) return false;
++        return s.contains("OK");
++    }
++
+     public synchronized String command(String cmd) {
++        return command(cmd, 3500);
++    }
++
++    public synchronized String command(String cmd, long timeoutMs) {
++        if (out == null || in == null || socket == null || !socket.isConnected()) {
++            logLine("TX " + cmd + " -> NOT_CONNECTED");
++            return "";
++        }
++
++        String clean = cmd.trim();
++        logLine("TX > " + clean);
++
+         try {
+-            out.write((cmd + "\r").getBytes());
++            // Discard stale bytes left by an adapter reset/previous transaction.
++            while (in.available() > 0) {
++                if (in.read() < 0) break;
++            }
++
++            out.write((clean + "\r").getBytes(StandardCharsets.US_ASCII));
+             out.flush();
+-            StringBuilder b=new StringBuilder();
+-            long end=System.currentTimeMillis()+1200;
+-            while(System.currentTimeMillis()<end) {
+-                if(in.available()>0) {
+-                    int c=in.read(); if(c<0) break;
+-                    if(c=='>') break; b.append((char)c);
+-                }
+-            }
+-            return b.toString();
+-        } catch(Exception e) { return ""; }
+-    }
+-    public void close() { try { socket.close(); } catch(Exception ignored) {} }
++
++            String response = readUntilPrompt(timeoutMs);
++            logLine("RX < " + compact(response));
++            return response;
++        } catch (Exception e) {
++            logLine("RX < EXCEPTION " + e.getClass().getSimpleName() + ": " + e.getMessage());
++            return "";
++        }
++    }
++
++    private String readUntilPrompt(long timeoutMs) throws IOException {
++        StringBuilder b = new StringBuilder();
++        long deadline = System.currentTimeMillis() + timeoutMs;
++        boolean gotAny = false;
++
++        while (System.currentTimeMillis() < deadline) {
++            int available = in.available();
++            if (available <= 0) {
++                try { Thread.sleep(10); } catch (InterruptedException ignored) {}
++                continue;
++            }
++
++            for (int i = 0; i < available; i++) {
++                int c = in.read();
++                if (c < 0) return b.toString();
++                gotAny = true;
++                if (c == '>') return b.toString();
++                b.append((char) c);
++            }
++
++            // If a clone omits the prompt, allow a short quiet period after receiving data.
++            if (gotAny && System.currentTimeMillis() + 250 >= deadline) break;
++        }
++        return b.toString();
++    }
++
++    public synchronized List<String> getLogSnapshot() {
++        return new ArrayList<>(log);
++    }
++
++    public synchronized void clearLog() {
++        log.clear();
++    }
++
++    private synchronized void logLine(String line) {
++        log.add(line);
++        while (log.size() > 120) log.remove(0);
++    }
++
++    private String compact(String s) {
++        if (s == null) return "";
++        return s.replace("\r", " ").replace("\n", " ").trim();
++    }
++
++    public boolean isAdapterConnected() { return adapterConnected; }
++    public boolean isEcuConnected() { return ecuConnected; }
++    public String getAdapterInfo() { return adapterInfo; }
++    public String getProtocol() { return protocol; }
++
++    public synchronized void close() {
++        ecuConnected = false;
++        adapterConnected = false;
++        try { if (in != null) in.close(); } catch (Exception ignored) {}
++        try { if (out != null) out.close(); } catch (Exception ignored) {}
++        closeSocketOnly();
++        in = null;
++        out = null;
++    }
++
++    private void closeSocketOnly() {
++        try { if (socket != null) socket.close(); } catch (Exception ignored) {}
++        socket = null;
++    }
+ }
+--- a/app/src/main/java/com/smartmatrix/obd/ObdEngine.java
++++ b/app/src/main/java/com/smartmatrix/obd/ObdEngine.java
+@@ -1,45 +1,203 @@
+ package com.smartmatrix.obd;
+ 
++import java.util.ArrayList;
++import java.util.LinkedHashSet;
++import java.util.List;
+ import java.util.Locale;
++import java.util.Set;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
+ 
+ public class ObdEngine {
+     public static class Data {
+         public int rpm = -1;
+-        public double maf = -1, stft = 0, ltft = 0, o2 = -1, ect = -1, tps = -1, map = -1, fuelPressure = -1;
+-    }
+-
+-    public static double hex(String s) {
+-        return Integer.parseInt(s.trim(), 16);
+-    }
++        public double maf = Double.NaN;
++        public double stft = Double.NaN;
++        public double ltft = Double.NaN;
++        public double o2 = Double.NaN;
++        public double ect = Double.NaN;
++        public double tps = Double.NaN;
++        public double map = Double.NaN;
++        public double fuelPressure = Double.NaN;
++        public double batteryVoltage = Double.NaN;
++
++        public boolean rpmAvailable() { return rpm >= 0; }
++        public boolean mafAvailable() { return !Double.isNaN(maf); }
++        public boolean stftAvailable() { return !Double.isNaN(stft); }
++        public boolean ltftAvailable() { return !Double.isNaN(ltft); }
++        public boolean o2Available() { return !Double.isNaN(o2); }
++        public boolean ectAvailable() { return !Double.isNaN(ect); }
++        public boolean tpsAvailable() { return !Double.isNaN(tps); }
++        public boolean mapAvailable() { return !Double.isNaN(map); }
++        public boolean fuelPressureAvailable() { return !Double.isNaN(fuelPressure); }
++        public boolean batteryAvailable() { return !Double.isNaN(batteryVoltage); }
++    }
++
++    private static final Pattern HEX_BYTE = Pattern.compile("(?i)(?<![0-9A-F])[0-9A-F]{2}(?![0-9A-F])");
+ 
+     public static Data parse(String pid, String raw) {
+         Data d = new Data();
++        if (pid == null || raw == null) return d;
++
++        List<Integer> bytes = hexBytes(raw);
++        int responseMode = responseModeFor(pid);
++        int requestedPid = Integer.parseInt(pid.substring(2), 16);
++        int idx = findResponse(bytes, responseMode, requestedPid);
++
+         try {
+-            String[] a = raw.replace("\r"," ").replace("\n"," ").trim().split("\\s+");
+-            int idx=-1;
+-            for(int i=0;i<a.length;i++) if(a[i].equalsIgnoreCase("41")) { idx=i; break; }
+-            if(idx<0) return d;
+-            if(pid.equals("010C") && idx+2<a.length) d.rpm=(int)((hex(a[idx+1])*256+hex(a[idx+2]))/4);
+-            if(pid.equals("010F") && idx+1<a.length) d.maf=hex(a[idx+1]);
+-            if(pid.equals("0106") && idx+1<a.length) d.stft=(hex(a[idx+1])-128)*100.0/128.0;
+-            if(pid.equals("0107") && idx+1<a.length) d.ltft=(hex(a[idx+1])-128)*100.0/128.0;
+-            if(pid.equals("0105") && idx+1<a.length) d.ect=hex(a[idx+1])-40;
+-            if(pid.equals("0111") && idx+1<a.length) d.tps=hex(a[idx+1])*100.0/255.0;
+-            if(pid.equals("010B") && idx+1<a.length) d.map=hex(a[idx+1]);
+-            if(pid.equals("010D") && idx+1<a.length) d.map=hex(a[idx+1]);
+-        } catch(Exception ignored) {}
++            if (idx < 0) return d;
++            switch (requestedPid) {
++                case 0x05:
++                    if (idx + 2 < bytes.size()) d.ect = bytes.get(idx + 2) - 40.0;
++                    break;
++                case 0x06:
++                    if (idx + 2 < bytes.size()) d.stft = trim(bytes.get(idx + 2));
++                    break;
++                case 0x07:
++                    if (idx + 2 < bytes.size()) d.ltft = trim(bytes.get(idx + 2));
++                    break;
++                case 0x0A:
++                    if (idx + 2 < bytes.size()) d.fuelPressure = bytes.get(idx + 2) * 3.0;
++                    break;
++                case 0x0B:
++                    if (idx + 2 < bytes.size()) d.map = bytes.get(idx + 2);
++                    break;
++                case 0x0C:
++                    if (idx + 3 < bytes.size()) {
++                        d.rpm = ((bytes.get(idx + 2) * 256) + bytes.get(idx + 3)) / 4;
++                    }
++                    break;
++                case 0x0F:
++                    // IAT is intentionally not assigned to MAF.
++                    break;
++                case 0x10:
++                    if (idx + 3 < bytes.size()) {
++                        d.maf = ((bytes.get(idx + 2) * 256) + bytes.get(idx + 3)) / 100.0;
++                    }
++                    break;
++                case 0x11:
++                    if (idx + 2 < bytes.size()) d.tps = bytes.get(idx + 2) * 100.0 / 255.0;
++                    break;
++                case 0x14:
++                    if (idx + 2 < bytes.size()) d.o2 = bytes.get(idx + 2) / 200.0;
++                    break;
++                case 0x42:
++                    if (idx + 3 < bytes.size()) {
++                        d.batteryVoltage =
++                                ((bytes.get(idx + 2) * 256) + bytes.get(idx + 3)) / 1000.0;
++                    }
++                    break;
++                default:
++                    break;
++            }
++        } catch (Exception ignored) {
++            // Keep the field unavailable rather than inventing a value.
++        }
+         return d;
+     }
++
++    public static boolean hasPositivePidResponse(String pid, String raw) {
++        if (raw == null) return false;
++        List<Integer> bytes = hexBytes(raw);
++        int requestedPid = Integer.parseInt(pid.substring(2), 16);
++        return findResponse(bytes, responseModeFor(pid), requestedPid) >= 0;
++    }
++
++    private static int responseModeFor(String pid) {
++        int mode = Integer.parseInt(pid.substring(0, 2), 16);
++        return (mode + 0x40) & 0xFF;
++    }
++
++    private static int findResponse(List<Integer> bytes, int responseMode, int requestedPid) {
++        for (int i = 0; i + 1 < bytes.size(); i++) {
++            if (bytes.get(i) == responseMode && bytes.get(i + 1) == requestedPid) {
++                return i;
++            }
++        }
++        return -1;
++    }
++
++    private static double trim(int a) {
++        return (a - 128) * 100.0 / 128.0;
++    }
++
++    public static List<Integer> hexBytes(String raw) {
++        List<Integer> out = new ArrayList<>();
++        Matcher m = HEX_BYTE.matcher(raw == null ? "" : raw);
++        while (m.find()) {
++            try {
++                out.add(Integer.parseInt(m.group(), 16));
++            } catch (NumberFormatException ignored) {}
++        }
++        return out;
++    }
++
++    public static List<String> parseDtc(String raw, int responseMode) {
++        List<Integer> bytes = hexBytes(raw);
++        List<String> result = new ArrayList<>();
++        for (int i = 0; i < bytes.size(); i++) {
++            if (bytes.get(i) != responseMode) continue;
++            for (int j = i + 1; j + 1 < bytes.size(); j += 2) {
++                int hi = bytes.get(j);
++                int lo = bytes.get(j + 1);
++                if (hi == 0 && lo == 0) continue;
++                result.add(decodeDtc(hi, lo));
++            }
++            if (!result.isEmpty()) break;
++        }
++        return result;
++    }
++
++    private static String decodeDtc(int hi, int lo) {
++        String[] letters = {"P", "C", "B", "U"};
++        int letter = (hi >> 6) & 0x03;
++        int digit1 = (hi >> 4) & 0x03;
++        int digit2 = hi & 0x0F;
++        int digit3 = (lo >> 4) & 0x0F;
++        int digit4 = lo & 0x0F;
++        return String.format(Locale.US, "%s%d%d%d%d",
++                letters[letter], digit1, digit2, digit3, digit4);
++    }
++
++    public static double parseAdapterVoltage(String raw) {
++        if (raw == null) return Double.NaN;
++        Matcher m = Pattern.compile("(?i)(\\d+(?:\\.\\d+)?)\\s*V").matcher(raw);
++        if (!m.find()) return Double.NaN;
++        try {
++            return Double.parseDouble(m.group(1));
++        } catch (NumberFormatException ignored) {
++            return Double.NaN;
++        }
++    }
++
+     public static String analyze(Data d) {
+-        double trim = d.stft + d.ltft;
+-        if(trim >= 35 && d.maf > 0 && d.rpm > 0)
+-            return "اشتباه قوي في خليط فقير: افحص تهريب الهواء بعد حساس الهواء، PCV، وجوانات الثلاجة.";
+-        if(trim >= 20)
+-            return "خليط فقير محتمل: راقب Fuel Trim ثم اختبر تهريب الهواء وضغط الوقود.";
+-        if(trim <= -20)
+-            return "خليط غني محتمل: افحص ضغط الوقود، البخاخات، MAF وتسرب بخار الوقود.";
+-        if(d.rpm > 0 && d.rpm < 650)
+-            return "الخمول منخفض: راقب TPS وMAF وMAP وFuel Trim وابحث عن سبب عدم ثبات الخمول.";
+-        return "لا يوجد انحراف حاسم حالياً؛ استمر في مراقبة حركة البيانات.";
++        double trim = 0;
++        boolean hasTrim = false;
++        if (d.stftAvailable()) { trim += d.stft; hasTrim = true; }
++        if (d.ltftAvailable()) { trim += d.ltft; hasTrim = true; }
++
++        if (hasTrim && trim >= 35 && d.mafAvailable() && d.rpmAvailable() && d.rpm > 0)
++            return "انحراف Fuel Trim مرتفع: افحص تهريب الهواء/العادم، MAF، ضغط الوقود والبخاخات باختبارات تأكيدية.";
++        if (hasTrim && trim >= 20)
++            return "Fuel Trim مرتفع: خليط فقير محتمل؛ راقب الاتجاه ثم اختبر السبب.";
++        if (hasTrim && trim <= -20)
++            return "Fuel Trim منخفض: خليط غني محتمل؛ راقب الاتجاه ثم اختبر ضغط الوقود والبخاخات وMAF.";
++        if (d.rpmAvailable() && d.rpm < 650)
++            return "الخمول منخفض؛ راقب TPS وMAF وMAP وFuel Trim وابحث عن السبب.";
++        if (!d.rpmAvailable() && !d.ectAvailable() && !d.mapAvailable())
++            return "لا توجد استجابة PID صالحة حتى الآن.";
++        return "لا يوجد انحراف حاسم في البيانات المتاحة حالياً.";
++    }
++
++    public static String formatDtcList(List<String> dtcs) {
++        if (dtcs == null || dtcs.isEmpty()) return "لا توجد أكواد مؤكدة.";
++        Set<String> unique = new LinkedHashSet<>(dtcs);
++        StringBuilder b = new StringBuilder();
++        for (String code : unique) {
++            if (b.length() > 0) b.append('\n');
++            b.append(code);
++        }
++        return b.toString();
+     }
+ }
+--- a/app/src/main/java/com/smartmatrix/obd/MainActivity.java
++++ b/app/src/main/java/com/smartmatrix/obd/MainActivity.java
+@@ -3,75 +3,211 @@
+ import android.Manifest;
+ import android.app.Activity;
+ import android.app.AlertDialog;
++import android.bluetooth.BluetoothAdapter;
++import android.bluetooth.BluetoothDevice;
+ import android.os.Bundle;
+ import android.os.Handler;
+-import android.widget.*;
+ import android.content.pm.PackageManager;
+-import android.bluetooth.BluetoothAdapter;
+-import android.bluetooth.BluetoothDevice;
+-import java.util.*;
++import android.widget.TextView;
++
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++import java.util.Set;
++
+ public class MainActivity extends Activity {
+     TextView status, live, diagnosis, codes, log;
+     ObdBluetooth obd = new ObdBluetooth();
+     Handler handler = new Handler();
+-    boolean running=false;
+-    ObdEngine.Data data=new ObdEngine.Data();
+-
+-    String[] pids={"010C","010F","0106","0107","0105","0111","010B"};
+-    String[] names={"RPM","MAF","STFT","LTFT","ECT","TPS","MAP"};
++    boolean running = false;
++    boolean ecuReady = false;
++    ObdEngine.Data data = new ObdEngine.Data();
++
++    String[] pids = {
++            "010C", // RPM
++            "0110", // MAF
++            "0106", // STFT B1
++            "0107", // LTFT B1
++            "0105", // ECT
++            "0111", // TPS
++            "010B", // MAP
++            "010A", // Fuel pressure
++            "0114", // O2 B1S1
++            "0142"  // Control module voltage
++    };
++
+     @Override public void onCreate(Bundle b) {
+         super.onCreate(b);
+         setContentView(R.layout.activity_main);
+-        status=findViewById(R.id.status); live=findViewById(R.id.live);
+-        diagnosis=findViewById(R.id.diagnosis); codes=findViewById(R.id.codes); log=findViewById(R.id.log);
++
++        status = findViewById(R.id.status);
++        live = findViewById(R.id.live);
++        diagnosis = findViewById(R.id.diagnosis);
++        codes = findViewById(R.id.codes);
++        log = findViewById(R.id.log);
++
+         findViewById(R.id.connect).setOnClickListener(v -> chooseDevice());
+-        findViewById(R.id.start).setOnClickListener(v -> { running=!running; if(running) poll(); });
+-        requestPermissions(new String[]{Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN}, 100);
+-    }
++        findViewById(R.id.start).setOnClickListener(v -> {
++            if (!ecuReady) {
++                status.setText("المحول غير متصل بـ ECU؛ لن تبدأ قراءة وهمية.");
++                return;
++            }
++            running = !running;
++            if (running) poll();
++        });
++
++        if (android.os.Build.VERSION.SDK_INT >= 31) {
++            requestPermissions(new String[] {
++                    Manifest.permission.BLUETOOTH_CONNECT,
++                    Manifest.permission.BLUETOOTH_SCAN
++            }, 100);
++        }
++    }
++
+     void chooseDevice() {
+-        BluetoothAdapter a=BluetoothAdapter.getDefaultAdapter();
+-        if(a==null){status.setText("الهاتف لا يدعم Bluetooth"); return;}
+-        Set<BluetoothDevice> paired=a.getBondedDevices();
+-        if(paired.isEmpty()){status.setText("اقرن محول ELM327 من إعدادات Bluetooth أولاً"); return;}
+-        ArrayList<String> names=new ArrayList<>(); ArrayList<String> macs=new ArrayList<>();
+-        for(BluetoothDevice d:paired){names.add(d.getName()+"\n"+d.getAddress()); macs.add(d.getAddress());}
+-        new AlertDialog.Builder(this).setTitle("اختر محول OBD")
+-            .setItems(names.toArray(new String[0]),(x,w)->{
+-                status.setText("جاري الاتصال...");
+-                new Thread(()->{
+-                    boolean ok=obd.connect(macs.get(w));
+-                    runOnUiThread(()->status.setText(ok?"متصل بـ OBD":"فشل الاتصال"));
+-                }).start();
+-            }).show();
+-    }
++        BluetoothAdapter a = BluetoothAdapter.getDefaultAdapter();
++        if (a == null) {
++            status.setText("الهاتف لا يدعم Bluetooth");
++            return;
++        }
++
++        Set<BluetoothDevice> paired;
++        try {
++            paired = a.getBondedDevices();
++        } catch (SecurityException e) {
++            status.setText("لم تُمنح صلاحية Bluetooth");
++            return;
++        }
++
++        if (paired.isEmpty()) {
++            status.setText("اقرن محول ELM327 من إعدادات Bluetooth أولاً");
++            return;
++        }
++
++        ArrayList<String> names = new ArrayList<>();
++        ArrayList<String> macs = new ArrayList<>();
++        for (BluetoothDevice d : paired) {
++            try {
++                names.add(d.getName() + "\n" + d.getAddress());
++                macs.add(d.getAddress());
++            } catch (SecurityException ignored) {}
++        }
++
++        new AlertDialog.Builder(this)
++                .setTitle("اختر محول OBD")
++                .setItems(names.toArray(new String[0]), (x, w) -> {
++                    status.setText("جاري تهيئة المحول واختبار ECU...");
++                    running = false;
++
++                    new Thread(() -> {
++                        ObdBluetooth.ConnectionResult result = obd.connect(macs.get(w));
++                        ecuReady = result.ecuConnected;
++
++                        runOnUiThread(() -> {
++                            if (result.ecuConnected) {
++                                status.setText("متصل بـ ECU فعلياً — " + result.message);
++                            } else if (result.adapterConnected) {
++                                status.setText("المحول متصل، لكن ECU غير مستجيب: " + result.message);
++                            } else {
++                                status.setText("فشل اتصال OBD: " + result.message);
++                            }
++                            refreshLog();
++                        });
++                    }).start();
++                }).show();
++    }
++
+     void poll() {
+-        if(!running) return;
+-        new Thread(()->{
+-            for(String p:pids){
+-                String raw=obd.command(p);
+-                ObdEngine.Data x=ObdEngine.parse(p,raw);
++        if (!running || !ecuReady) return;
++
++        new Thread(() -> {
++            for (String pid : pids) {
++                String raw = obd.command(pid, 3500);
++                ObdEngine.Data x = ObdEngine.parse(pid, raw);
+                 merge(x);
+             }
+-            runOnUiThread(()->{
++
++            // 0142 is the ECU-reported control-module voltage. If the vehicle does not
++            // expose that PID, ATRV gives the adapter-side vehicle supply voltage.
++            if (!data.batteryAvailable()) {
++                double adapterVoltage = ObdEngine.parseAdapterVoltage(
++                        obd.command("ATRV", 2500));
++                if (!Double.isNaN(adapterVoltage)) {
++                    data.batteryVoltage = adapterVoltage;
++                }
++            }
++
++            String dtcRaw = obd.command("03", 5000);
++            List<String> confirmed = ObdEngine.parseDtc(dtcRaw, 0x43);
++
++            String pendingRaw = obd.command("07", 5000);
++            List<String> pending = ObdEngine.parseDtc(pendingRaw, 0x47);
++
++            runOnUiThread(() -> {
+                 render();
+-                diagnosis.setText("التحليل اللحظي: "+ObdEngine.analyze(data));
++                diagnosis.setText("التحليل اللحظي: " + ObdEngine.analyze(data));
++
++                StringBuilder c = new StringBuilder();
++                c.append("مؤكدة:\n").append(ObdEngine.formatDtcList(confirmed));
++                c.append("\n\nمعلّقة:\n").append(ObdEngine.formatDtcList(pending));
++                codes.setText(c.toString());
++                refreshLog();
+             });
+-            handler.postDelayed(this::poll,350);
++
++            handler.postDelayed(this::poll, 250);
+         }).start();
+     }
++
+     synchronized void merge(ObdEngine.Data x) {
+-        if(x.rpm>=0)data.rpm=x.rpm;
+-        if(x.maf>=0)data.maf=x.maf;
+-        if(x.stft!=0)data.stft=x.stft;
+-        if(x.ltft!=0)data.ltft=x.ltft;
+-        if(x.ect>=0)data.ect=x.ect;
+-        if(x.tps>=0)data.tps=x.tps;
+-        if(x.map>=0)data.map=x.map;
+-    }
++        if (x.rpmAvailable()) data.rpm = x.rpm;
++        if (x.mafAvailable()) data.maf = x.maf;
++        if (x.stftAvailable()) data.stft = x.stft;
++        if (x.ltftAvailable()) data.ltft = x.ltft;
++        if (x.ectAvailable()) data.ect = x.ect;
++        if (x.tpsAvailable()) data.tps = x.tps;
++        if (x.mapAvailable()) data.map = x.map;
++        if (x.fuelPressureAvailable()) data.fuelPressure = x.fuelPressure;
++        if (x.o2Available()) data.o2 = x.o2;
++        if (x.batteryAvailable()) data.batteryVoltage = x.batteryVoltage;
++    }
++
+     void render() {
+         live.setText(String.format(Locale.US,
+-            "RPM: %d\\nMAF: %.1f g/s\\nSTFT B1: %.1f %%\\nLTFT B1: %.1f %%\\nECT: %.0f °C\\nTPS: %.1f %%\\nMAP: %.0f kPa",
+-            data.rpm,data.maf,data.stft,data.ltft,data.ect,data.tps,data.map));
+-        log.setText("آخر قراءة: "+new Date()+"\\n"+ObdEngine.analyze(data));
++                "RPM: %s\nMAF: %s g/s\nSTFT B1: %s %%\nLTFT B1: %s %%\n" +
++                        "O2 B1S1: %s V\nECT: %s °C\nTPS: %s %%\nMAP: %s kPa\n" +
++                        "Fuel Pressure: %s kPa\nBattery Voltage: %s V",
++                rpmText(), number(data.maf, 1), number(data.stft, 1),
++                number(data.ltft, 1), number(data.o2, 3),
++                number(data.ect, 0), number(data.tps, 1),
++                number(data.map, 0), number(data.fuelPressure, 0),
++                number(data.batteryVoltage, 3)));
++    }
++
++    String rpmText() {
++        return data.rpmAvailable() ? String.valueOf(data.rpm) : "غير متاح";
++    }
++
++    String number(double value, int decimals) {
++        if (Double.isNaN(value)) return "غير متاح";
++        return String.format(Locale.US, "%." + decimals + "f", value);
++    }
++
++    void refreshLog() {
++        List<String> entries = obd.getLogSnapshot();
++        StringBuilder b = new StringBuilder();
++        int start = Math.max(0, entries.size() - 80);
++        for (int i = start; i < entries.size(); i++) {
++            if (b.length() > 0) b.append('\n');
++            b.append(entries.get(i));
++        }
++        b.append("\n\n").append(new Date());
++        log.setText(b.toString());
++    }
++
++    @Override protected void onDestroy() {
++        running = false;
++        obd.close();
++        super.onDestroy();
+     }
+ }

@@ -1,0 +1,84 @@
+name: Build Smart Matrix OBD APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Install Android SDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build Release APK
+        run: |
+          gradle assembleRelease --no-daemon
+      - name: Find unsigned APK
+        run: |
+          APK=$(find app/build/outputs -type f -name "*unsigned.apk" | head -1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: Unsigned APK not found."
+            find app/build/outputs -type f -name "*.apk" -print
+            exit 1
+          fi
+
+          echo "Unsigned APK found:"
+          echo "$APK"
+
+          mkdir -p release-apk
+          cp "$APK" release-apk/SmartMatrixOBD-unsigned.apk
+      - name: Create signing key
+        run: |
+          keytool -genkeypair             -alias smartmatrix             -keyalg RSA             -keysize 2048             -validity 10000             -keystore smartmatrix-release.jks             -storepass smartmatrix123             -keypass smartmatrix123             -dname "CN=Smart Matrix OBD, OU=SmartMatrix, O=SmartMatrix, L=Libya, ST=Libya, C=LY"
+      - name: Sign APK
+        run: |
+          UNSIGNED="release-apk/SmartMatrixOBD-unsigned.apk"
+          SIGNED="release-apk/SmartMatrixOBD.apk"
+
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign             --ks smartmatrix-release.jks             --ks-key-alias smartmatrix             --ks-pass pass:smartmatrix123             --key-pass pass:smartmatrix123             --out "$SIGNED"             "$UNSIGNED"
+      - name: Verify signed APK
+        run: |
+          APK="release-apk/SmartMatrixOBD.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+      - name: Check APK
+        run: |
+          APK="release-apk/SmartMatrixOBD.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging "$APK" | head -20
+      - name: Check APK is not debuggable
+        run: |
+          APK="release-apk/SmartMatrixOBD.apk"
+          if "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump xmltree "$APK" --file AndroidManifest.xml | grep -q 'debuggable.*=true'; then
+            echo "ERROR: APK is still debuggable."
+            exit 1
+          fi
+          echo "OK: APK is not debuggable."
+      - name: Calculate SHA-256
+        run: |
+          sha256sum release-apk/SmartMatrixOBD.apk
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartMatrixOBD-release-apk
+          path: release-apk/SmartMatrixOBD.apk

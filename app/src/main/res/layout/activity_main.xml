@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:background="@color/bg" android:layout_width="match_parent" android:layout_height="match_parent">
+    <LinearLayout
+        android:orientation="vertical" android:padding="16dp"
+        android:layout_width="match_parent" android:layout_height="wrap_content">
+        <TextView android:text="SMART MATRIX OBD" android:textColor="@color/text"
+            android:textSize="24sp" android:textStyle="bold"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+        <TextView android:id="@+id/status" android:text="غير متصل"
+            android:textColor="@color/muted" android:layout_marginTop="4dp"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+        <LinearLayout android:orientation="horizontal" android:layout_marginTop="14dp"
+            android:layout_width="match_parent" android:layout_height="wrap_content">
+            <Button android:id="@+id/connect" android:text="اتصال OBD"
+                android:layout_weight="1" android:layout_width="0dp" android:layout_height="wrap_content"/>
+            <Button android:id="@+id/start" android:text="بدء التحليل"
+                android:layout_weight="1" android:layout_marginStart="8dp"
+                android:layout_width="0dp" android:layout_height="wrap_content"/>
+        </LinearLayout>
+        <TextView android:id="@+id/diagnosis" android:text="التحليل: بانتظار البيانات"
+            android:textColor="@color/accent" android:textSize="18sp"
+            android:padding="14dp" android:layout_marginTop="14dp"
+            android:background="@color/panel"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+        <TextView android:text="LIVE DATA" android:textColor="@color/text"
+            android:textStyle="bold" android:textSize="18sp"
+            android:layout_marginTop="16dp"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+        <TextView android:id="@+id/live" android:text="RPM: --
+MAF: --
+STFT B1: --
+LTFT B1: --
+O2 B1S1: --
+ECT: --
+TPS: --
+MAP: --
+Fuel Pressure: --
+Battery Voltage: --"
+            android:textColor="@color/text" android:textSize="16sp"
+            android:padding="14dp" android:background="@color/panel"
+            android:layout_marginTop="8dp"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+        <TextView android:text="الأكواد" android:textColor="@color/text"
+            android:textStyle="bold" android:textSize="18sp"
+            android:layout_marginTop="16dp"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+        <TextView android:id="@+id/codes" android:text="لا توجد قراءة بعد"
+            android:textColor="@color/warn" android:textSize="16sp"
+            android:padding="14dp" android:background="@color/panel"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+        <TextView android:text="سجل الاتصال والطلبات/الردود" android:textColor="@color/text"
+            android:textStyle="bold" android:textSize="18sp"
+            android:layout_marginTop="16dp"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+        <TextView android:id="@+id/log" android:text="ابدأ الاتصال ثم شغّل التحليل."
+            android:textColor="@color/muted" android:padding="14dp"
+            android:background="@color/panel"
+            android:layout_width="match_parent" android:layout_height="wrap_content"/>
+    </LinearLayout>
+</ScrollView>

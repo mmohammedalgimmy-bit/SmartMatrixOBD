@@ -1,0 +1,18 @@
+R_DEF: Internal format may change without notice
+local
+color accent
+color bg
+color danger
+color muted
+color panel
+color text
+color warn
+id codes
+id connect
+id diagnosis
+id live
+id log
+id start
+id status
+layout activity_main
+style Theme.SmartMatrixOBD

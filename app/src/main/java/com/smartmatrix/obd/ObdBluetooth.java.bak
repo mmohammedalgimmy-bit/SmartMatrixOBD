@@ -1,0 +1,246 @@
+package com.smartmatrix.obd;
+
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothSocket;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.UUID;
+
+public class ObdBluetooth {
+    private BluetoothSocket socket;
+    private InputStream in;
+    private OutputStream out;
+    private static final UUID SPP =
+            UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
+
+    private final List<String> log = new ArrayList<>();
+    private volatile boolean adapterConnected = false;
+    private volatile boolean ecuConnected = false;
+    private String adapterInfo = "";
+    private String protocol = "";
+
+    public static class ConnectionResult {
+        public final boolean adapterConnected;
+        public final boolean ecuConnected;
+        public final String message;
+
+        ConnectionResult(boolean adapterConnected, boolean ecuConnected, String message) {
+            this.adapterConnected = adapterConnected;
+            this.ecuConnected = ecuConnected;
+            this.message = message;
+        }
+    }
+
+    public synchronized ConnectionResult connect(String mac) {
+        close();
+        clearLog();
+
+        try {
+            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+            if (adapter == null) {
+                return new ConnectionResult(false, false, "Bluetooth غير متاح على الجهاز");
+            }
+
+            BluetoothDevice device = adapter.getRemoteDevice(mac);
+            adapter.cancelDiscovery();
+
+            IOException last = null;
+            try {
+                socket = device.createRfcommSocketToServiceRecord(SPP);
+                socket.connect();
+            } catch (IOException first) {
+                last = first;
+                closeSocketOnly();
+                try {
+                    socket = device.createInsecureRfcommSocketToServiceRecord(SPP);
+                    socket.connect();
+                } catch (IOException second) {
+                    last = second;
+                    closeSocketOnly();
+                    try {
+                        java.lang.reflect.Method m =
+                                device.getClass().getMethod("createRfcommSocket", int.class);
+                        socket = (BluetoothSocket) m.invoke(device, 1);
+                        socket.connect();
+                    } catch (Exception third) {
+                        if (third.getCause() instanceof IOException) {
+                            last = (IOException) third.getCause();
+                        }
+                    }
+                }
+            }
+
+            if (socket == null || !socket.isConnected()) {
+                return new ConnectionResult(false, false,
+                        "فشل فتح قناة Bluetooth: " +
+                                (last == null ? "unknown" : last.getMessage()));
+            }
+
+            in = socket.getInputStream();
+            out = socket.getOutputStream();
+            adapterConnected = true;
+            logLine("BLUETOOTH CONNECTED " + mac);
+
+            String reset = command("ATZ", 5000);
+            if (!looksLikeElmReset(reset)) {
+                return fail("المحول متصل لكن لم يستجب كـ ELM327. الرد: " + compact(reset));
+            }
+
+            String[] init = {
+                    "ATE0",
+                    "ATL0",
+                    "ATS1",
+                    "ATH0",
+                    "ATAT1",
+                    "ATAL",
+                    "ATSP0"
+            };
+
+            for (String cmd : init) {
+                String response = command(cmd, 3000);
+                if (!isOkOrExpected(response, cmd)) {
+                    return fail("فشل تهيئة " + cmd + ". الرد: " + compact(response));
+                }
+            }
+
+            String voltage = command("ATRV", 2500);
+            logLine("ADAPTER VOLTAGE <- " + compact(voltage));
+
+            // 0100 is the ECU-level handshake. ATSP0/OK only proves the adapter accepted
+            // its configuration; 41 00 proves that an ECU answered the OBD request.
+            String supported = command("0100", 8000);
+            if (!ObdEngine.hasPositivePidResponse("0100", supported)) {
+                return fail("المحول متصل، لكن ECU لم يرد على 0100. الرد: " + compact(supported));
+            }
+
+            ecuConnected = true;
+            String dp = command("ATDP", 2500);
+            protocol = compact(dp);
+            logLine("ECU ONLINE; PROTOCOL <- " + protocol);
+
+            return new ConnectionResult(true, true,
+                    "متصل بالمحول وECU؛ البروتوكول: " + protocol);
+        } catch (Exception e) {
+            return fail("خطأ اتصال: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
+    }
+
+    private ConnectionResult fail(String message) {
+        logLine("CONNECTION FAILED: " + message);
+        ecuConnected = false;
+        return new ConnectionResult(adapterConnected, false, message);
+    }
+
+    private boolean looksLikeElmReset(String response) {
+        String s = response == null ? "" : response.toUpperCase(Locale.US);
+        return s.contains("ELM") || s.contains("OBD") || s.contains("OK");
+    }
+
+    private boolean isOkOrExpected(String response, String cmd) {
+        String s = response == null ? "" : response.toUpperCase(Locale.US);
+        if (s.contains("ERROR") || s.contains("UNABLE") || s.contains("NO DATA")) return false;
+        return s.contains("OK");
+    }
+
+    public synchronized String command(String cmd) {
+        return command(cmd, 3500);
+    }
+
+    public synchronized String command(String cmd, long timeoutMs) {
+        if (out == null || in == null || socket == null || !socket.isConnected()) {
+            logLine("TX " + cmd + " -> NOT_CONNECTED");
+            return "";
+        }
+
+        String clean = cmd.trim();
+        logLine("TX > " + clean);
+
+        try {
+            // Discard stale bytes left by an adapter reset/previous transaction.
+            while (in.available() > 0) {
+                if (in.read() < 0) break;
+            }
+
+            out.write((clean + "\r").getBytes(StandardCharsets.US_ASCII));
+            out.flush();
+
+            String response = readUntilPrompt(timeoutMs);
+            logLine("RX < " + compact(response));
+            return response;
+        } catch (Exception e) {
+            logLine("RX < EXCEPTION " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            return "";
+        }
+    }
+
+    private String readUntilPrompt(long timeoutMs) throws IOException {
+        StringBuilder b = new StringBuilder();
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        boolean gotAny = false;
+
+        while (System.currentTimeMillis() < deadline) {
+            int available = in.available();
+            if (available <= 0) {
+                try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+                continue;
+            }
+
+            for (int i = 0; i < available; i++) {
+                int c = in.read();
+                if (c < 0) return b.toString();
+                gotAny = true;
+                if (c == '>') return b.toString();
+                b.append((char) c);
+            }
+
+            // If a clone omits the prompt, allow a short quiet period after receiving data.
+            if (gotAny && System.currentTimeMillis() + 250 >= deadline) break;
+        }
+        return b.toString();
+    }
+
+    public synchronized List<String> getLogSnapshot() {
+        return new ArrayList<>(log);
+    }
+
+    public synchronized void clearLog() {
+        log.clear();
+    }
+
+    private synchronized void logLine(String line) {
+        log.add(line);
+        while (log.size() > 120) log.remove(0);
+    }
+
+    private String compact(String s) {
+        if (s == null) return "";
+        return s.replace("\r", " ").replace("\n", " ").trim();
+    }
+
+    public boolean isAdapterConnected() { return adapterConnected; }
+    public boolean isEcuConnected() { return ecuConnected; }
+    public String getAdapterInfo() { return adapterInfo; }
+    public String getProtocol() { return protocol; }
+
+    public synchronized void close() {
+        ecuConnected = false;
+        adapterConnected = false;
+        try { if (in != null) in.close(); } catch (Exception ignored) {}
+        try { if (out != null) out.close(); } catch (Exception ignored) {}
+        closeSocketOnly();
+        in = null;
+        out = null;
+    }
+
+    private void closeSocketOnly() {
+        try { if (socket != null) socket.close(); } catch (Exception ignored) {}
+        socket = null;
+    }
+}
